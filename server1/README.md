@@ -19,7 +19,10 @@ O que cada um faz
 
 
 
-PastaDevolveplay/título, ano, capa, sinopse, type, watch, e se série: seasons[].episodes[].watchvideo/{ format, url, headers } do stream
+PastaDevolveplay/título, ano, capa, sinopse, type, watch, e se série:
+
+seasons[].episodes[].watchvideo/{ format, url, headers } do stream
+
 O watch do play já vem montado:
 
 https://api.tedflix.site/vN/video/{url_bruta}
@@ -27,5 +30,7 @@ https://api.tedflix.site/vN/video/{url_bruta}
 Uso no Express
 
 JavaScriptapp.get('/v1/play/*', require('./play/v1').handler);
+
 app.get('/v1/video/*', require('./video/v1').handler);
+
 // ... v2 v3 v4
