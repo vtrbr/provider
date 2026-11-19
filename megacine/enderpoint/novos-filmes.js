@@ -3,7 +3,7 @@
  * GET /lancamentos
  *
  * Fonte: topfilmes.biz — seção "Nossos Destaques" da home (/home)
- * Play prefix: https://api.tedflix.site/v4/play/
+ * Link: URL crua (https://topfilmes.biz/assistir/<slug>) — sem prefixo de API
  *
  * Express / Fastify:
  *   const { handler } = require('./lancamentos');
@@ -20,8 +20,6 @@ const NodeHttp = require('http');
 
 // ---------- Config ----------
 const BASE = (process.env.TOPFILMES_URL || 'https://topfilmes.biz').replace(/\/+$/, '');
-const PUBLIC_API = (process.env.PUBLIC_API_BASE || 'https://api.tedflix.site').replace(/\/+$/, '');
-const PLAY_PREFIX = `${PUBLIC_API}/v4/play/`;
 
 const SOURCE = 'topfilmes';
 const HOME_URL = `${BASE}/home`;
@@ -83,7 +81,7 @@ function parseHome(html) {
       title,
       year: null,   // carrossel não traz ano
       rating: null, // nem nota
-      link: PLAY_PREFIX + absUrl(href),
+      link: absUrl(href), // URL crua do topfilmes
       cover: cleanCover(absUrl(coverRaw)),
       source: SOURCE,
     });
