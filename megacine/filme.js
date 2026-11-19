@@ -1,475 +1,206 @@
 'use strict';
 /**
- * GET /filme/*  ou  GET /filme?url=
+ * GET /topfilmes/filmes
  *
- * Recebe a URL do filme no MegaCine (ou direto do ViewPlayer)
- * e devolve metadados + URL do player de cada qualidade/áudio.
- *
- * NÃO resolve m3u8/mp4 — isso fica no video.js:
- *   player do filme → /video?url=https://viewplayer.online/filme/{imdbId}
- *
- * Aceita:
- *   - https://megacine.yachts/filmes/assistir-...
- *   - /filmes/assistir-...
- *   - filmes/assistir-...
- *   - assistir-...                 (assume prefixo /filmes/)
- *   - https://viewplayer.online/filme/{imdbId}
+ * Fonte: topfilmes.biz — seção "Últimos Filmes Adicionados" da home (/home)
+ * Paginação: 1 → 151  (via /home?p=N)
+ * Play prefix: https://api.tedflix.site/v4/play/
+ * Cache: 24h
  *
  * Express / Fastify:
- *   const { handler } = require('./filme');
- *   app.get('/filme', handler);
- *   app.get('/filme/*', handler);
+ *   const { handler } = require('./filmes_topfilmes');
+ *   app.get('/topfilmes/filmes', handler);
  *
  * Uso direto:
- *   const { getMovie } = require('./filme');
- *   const data = await getMovie('https://megacine.yachts/filmes/...');
+ *   const { getTopfilmesFilmes } = require('./filmes_topfilmes');
+ *   const data = await getTopfilmesFilmes();
  */
 
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
+const axios = require('axios');
+const cheerio = require('cheerio');
+const NodeHttp = require('http');
 
-const TIMEOUT = Number(process.env.PROVIDER_TIMEOUT_MS) || 25000;
-const MEGACINE = (process.env.MEGACINE_URL || 'https://megacine.yachts').replace(/\/+$/, '');
-const VIEWPLAYER = 'https://viewplayer.online';
+// ---------- Config ----------
+const BASE = (process.env.TOPFILMES_URL || 'https://topfilmes.biz').replace(/\/+$/, '');
+const PUBLIC_API = (process.env.PUBLIC_API_BASE || 'https://api.tedflix.site').replace(/\/+$/, '');
+const PLAY_PREFIX = `${PUBLIC_API}/v4/play/`;
 
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const SOURCE = 'topfilmes';
+const MAX_PAGES = 151;
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
+const CONCURRENCY = 6;
 
-/* ───────────────── HTTP ───────────────── */
+// ---------- HTTP ----------
+const httpClient = axios.create({
+  timeout: Number(process.env.PROVIDER_TIMEOUT_MS) || 25000,
+  headers: {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml,*/*;q=0.8',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+  },
+  validateStatus: (s) => s >= 200 && s < 500,
+  httpAgent: new NodeHttp.Agent({ keepAlive: true, maxSockets: 30 }),
+});
 
-function request(url, opts = {}) {
-  return new Promise((resolve, reject) => {
-    let parsed;
-    try {
-      parsed = new URL(url);
-    } catch {
-      return reject(new Error('URL inválida: ' + url));
-    }
-    const lib = parsed.protocol === 'http:' ? http : https;
-    const req = lib.request(
-      {
-        protocol: parsed.protocol,
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-        path: parsed.pathname + parsed.search,
-        method: opts.method || 'GET',
-        headers: {
-          'User-Agent': UA,
-          Accept: opts.accept || 'text/html,application/xhtml+xml,*/*;q=0.8',
-          'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-          ...(opts.headers || {}),
-        },
-        timeout: TIMEOUT,
-      },
-      (res) => {
-        const chunks = [];
-        res.on('data', (c) => chunks.push(c));
-        res.on('end', () => {
-          resolve({
-            status: res.statusCode || 0,
-            headers: res.headers,
-            text: Buffer.concat(chunks).toString('utf8'),
-          });
-        });
-      }
-    );
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('timeout'));
-    });
-    req.end();
-  });
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function getHtml(url, headers = {}) {
-  const res = await request(url, {
-    accept: 'text/html',
-    headers: { Accept: 'text/html', ...headers },
-  });
-  if (res.status >= 400) {
-    const err = new Error(`HTTP ${res.status}`);
-    err.status = res.status;
-    throw err;
-  }
-  return res.text;
-}
-
-/* ───────────────── helpers ───────────────── */
-
-function rawFromReq(req) {
-  const candidates = [
-    req.params && (req.params[0] || req.params.url || req.params.path),
-    req.query && (req.query.url || req.query.u || req.query.link || req.query.filme),
-  ].filter(Boolean);
-
-  let raw = candidates[0] ? String(candidates[0]) : '';
-
-  if (!raw && req.originalUrl) {
-    const m = String(req.originalUrl).match(/\/filme\/(.+?)(?:\?|$)/i);
-    if (m) raw = m[1];
-  }
-  if (!raw && req.url) {
-    const m = String(req.url).match(/\/filme\/(.+?)(?:\?|$)/i);
-    if (m) raw = m[1];
-  }
-
-  try {
-    raw = decodeURIComponent(String(raw || '').trim());
-  } catch {
-    raw = String(raw || '').trim();
-  }
-
-  return raw;
-}
-
-function decodeHtml(s) {
-  return String(s || '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, ' ')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/\s+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function firstMatch(html, re, group = 1) {
-  const m = String(html).match(re);
-  return m ? (m[group] || m[0]).trim() : null;
-}
-
-function absUrl(base, href) {
+// ---------- Helpers ----------
+function absUrl(href) {
   if (!href) return null;
-  href = href.replace(/^['"]|['"]$/g, '').trim();
   if (href.startsWith('//')) return 'https:' + href;
   if (/^https?:\/\//i.test(href)) return href;
-  try {
-    return new URL(href, base).toString();
-  } catch {
-    return null;
-  }
+  return BASE + (href.startsWith('/') ? href : '/' + href);
 }
 
-/** Normaliza a URL passada para pageUrl do MegaCine */
-function buildPageUrl(raw) {
-  if (!raw) return null;
-  if (/^https?:\/\//i.test(raw)) return raw;
-  if (raw.startsWith('/')) return MEGACINE + raw;
-  if (/^filmes?\//i.test(raw)) return MEGACINE + '/' + raw;
-  // Assume slug → /filmes/{slug}
-  return MEGACINE + '/filmes/' + raw;
+function pageUrl(page) {
+  return page <= 1
+    ? `${BASE}/home`
+    : `${BASE}/home?p=${page}`;
 }
 
-/** URL canônica do player de filme no ViewPlayer */
-function moviePlayerUrl(imdbId) {
-  return `${VIEWPLAYER}/filme/${imdbId}`;
-}
+// ---------- Parser ----------
+function parsePage(html) {
+  const $ = cheerio.load(html);
+  const items = [];
 
-/* ───────────────── parse MegaCine page ───────────────── */
+  // só os cards da seção "Últimos Filmes Adicionados" (.filmes .filme)
+  // (o carrossel de destaques usa .scrolling-wrapper .card, então não bate)
+  $('.filmes .filme').each((_, el) => {
+    const $el = $(el);
 
-function parseMegaCineMovie(html, pageUrl) {
-  // título
-  const title =
-    firstMatch(html, /id=["']titleHis["'][^>]*>([^<]+)/i) ||
-    firstMatch(html, /<h1[^>]*itemprop=["']name["'][^>]*>([^<]+)/i) ||
-    firstMatch(html, /property=["']og:title["'][^>]*content=["']([^"']+)/i) ||
-    firstMatch(html, /<title>\s*Assistir\s+(.+?)\s+Dublado/i) ||
-    firstMatch(html, /<title>([^<]+)/i);
+    const $a = $el.find('a[href*="/assistir/"]').first();
+    const href = $a.attr('href');
+    if (!href) return;
 
-  // título original
-  const originalTitle =
-    firstMatch(html, /T[ií]tulo original:\s*<span[^>]*class=["']valor["'][^>]*>([^<]+)/i) ||
-    firstMatch(html, /T[ií]tulo original:\s*<span[^>]*>([^<]+)/i);
+    const title = $el.find('.title').first().text().trim();
+    if (!title) return;
 
-  // nota + votos
-  const rating =
-    firstMatch(html, /itemprop=["']ratingValue["'][^>]*>([0-9.,]+)/i) ||
-    firstMatch(html, /data-rating=["']([^"']+)/i);
-  const ratingCount = firstMatch(html, /itemprop=["']ratingCount["'][^>]*>(\d+)/i);
+    const year = $el.find('.year').first().text().trim() || null;
 
-  // data de lançamento + ano
-  const releaseDate = firstMatch(
-    html,
-    /itemprop=["']dateCreated["'][^>]*>([^<]+)/i
-  ) || firstMatch(html, /DATA DE LAN[ÇC]AMENTO:[\s\S]{0,120}?<span[^>]*>([^<]+)/i);
-  const yearM = releaseDate ? releaseDate.match(/(\d{4})/) : null;
-  const year = yearM ? Number(yearM[1]) : null;
+    let rating = $el.find('.tt-imdb').first().text().trim();
+    rating = rating || null;
 
-  // duração (opcional)
-  const runtimeM =
-    firstMatch(html, /DURA[ÇC][ÃA]O:[\s\S]{0,120}?<span[^>]*class=["']valor["'][^>]*>([^<]+)/i) ||
-    firstMatch(html, /class=["']runtime["'][^>]*>([^<]+)/i);
-  const runtime = runtimeM ? decodeHtml(runtimeM) : null;
+    // data-src traz a URL limpa (sem _filter(blur))
+    const $img = $el.find('img').first();
+    const cover = absUrl($img.attr('data-src') || $img.attr('src') || null);
 
-  // poster
-  const poster =
-    firstMatch(html, /id=["']thumbHis["'][^>]*src=["']([^"']+)/i) ||
-    firstMatch(html, /itemprop=["']image["'][^>]*src=["']([^"']+)/i) ||
-    firstMatch(html, /property=["']og:image["'][^>]*content=["']([^"']+)/i);
-
-  // backdrop (inline style em #dt_contenedor)
-  const backdropMatch = html.match(
-    /#dt_contenedor\s*\{[^}]*background-image:\s*url\((['"]?)([^)'"]+)\1\)/i
-  );
-  const backdrop = backdropMatch ? backdropMatch[2] : null;
-
-  // sinopse
-  let overview = null;
-  const sin = firstMatch(html, /class=["']sinopse-texto["'][^>]*>([\s\S]*?)<\/div>/i);
-  if (sin) overview = decodeHtml(sin);
-
-  // gêneros (do bloco .sgeneros, evita menu)
-  const genres = [];
-  const genreBlock = firstMatch(html, /class=["']sgeneros["'][^>]*>([\s\S]*?)<\/div>/i);
-  if (genreBlock) {
-    const re = /\/generos\/[^"']+["'][^>]*>([^<]+)/gi;
-    let m;
-    while ((m = re.exec(genreBlock))) {
-      const g = decodeHtml(m[1]).trim();
-      if (g && !genres.includes(g)) genres.push(g);
-    }
-  }
-
-  // trailer (YouTube) — iframe preferido, JSON-LD como fallback
-  const trailerUrl =
-    firstMatch(
-      html,
-      /id=["']source-player-trailer["'][\s\S]{0,800}?<iframe[^>]*src=["'](https?:\/\/www\.youtube\.com\/embed\/[^"']+)["']/i
-    ) ||
-    firstMatch(html, /"embedUrl":\s*"(https?:\/\/[^"]*youtube\.com\/embed\/[^"]*)"/i);
-
-  // id do post
-  const postId =
-    firstMatch(html, /postid-(\d+)/i) ||
-    firstMatch(html, /data-post=["'](\d+)["']/i);
-
-  // labels das opções (data-nume → "PRINCIPAL"/"DUBLADO"/...)
-  const playerLabels = {};
-  const reOpt = /data-nume=["'](\d+)["'][^>]*>[\s\S]{0,400}?<span class=["']title["']>([^<]+)</gi;
-  let om;
-  while ((om = reOpt.exec(html))) {
-    playerLabels[om[1]] = decodeHtml(om[2]).trim();
-  }
-
-  // extrai cada <div id="source-player-N"> com iframe viewplayer
-  const players = [];
-  const reIframe =
-    /id=["']source-player-(\d+)["'][\s\S]{0,1200}?<iframe[^>]*src=["'](https?:\/\/viewplayer\.online\/filme\/[^"']+)["']/gi;
-  let im;
-  while ((im = reIframe.exec(html))) {
-    const nume = im[1];
-    const playerUrl = im[2];
-    const imdbM = playerUrl.match(/\/filme\/(tt\d+)/i);
-    players.push({
-      nume,
-      label: playerLabels[nume] || 'PRINCIPAL',
-      player: playerUrl,
-      imdbId: imdbM ? imdbM[1] : null,
+    items.push({
+      title,
+      year,
+      rating,
+      link: PLAY_PREFIX + absUrl(href),
+      cover,
+      source: SOURCE,
     });
-  }
+  });
 
-  // fallback: se não achou iframe dentro de source-player, procura solto no HTML
-  if (players.length === 0) {
-    const fb = firstMatch(html, /(https?:\/\/viewplayer\.online\/filme\/tt\d+)/i);
-    if (fb) {
-      const imdbM = fb.match(/\/filme\/(tt\d+)/i);
-      players.push({
-        nume: '1',
-        label: 'PRINCIPAL',
-        player: fb,
-        imdbId: imdbM ? imdbM[1] : null,
-      });
+  return items;
+}
+
+// ---------- Fetch ----------
+async function fetchPage(page, retries = 2) {
+  const url = pageUrl(page);
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const { data } = await httpClient.get(url);
+      return parsePage(data);
+    } catch (err) {
+      if (attempt === retries) {
+        console.error(`[${SOURCE}:filmes] page ${page} FAIL: ${err.message}`);
+        return [];
+      }
+      await sleep(400 * attempt);
+    }
+  }
+  return [];
+}
+
+// ---------- Scrape completo ----------
+async function scrapeAll() {
+  const items = [];
+  let cursor = 1;
+  let done = 0;
+  let emptyStreak = 0;
+  const t0 = Date.now();
+
+  async function worker() {
+    while (cursor <= MAX_PAGES) {
+      const page = cursor++;
+      const pageItems = await fetchPage(page);
+      for (const it of pageItems) items.push(it);
+      done++;
+
+      if (pageItems.length === 0) emptyStreak++;
+      else emptyStreak = 0;
+
+      if (emptyStreak >= 5) {
+        console.log(
+          `[${SOURCE}:filmes] parando em ${page} (5 páginas vazias seguidas)`
+        );
+        cursor = MAX_PAGES + 1;
+        return;
+      }
+
+      if (done % 20 === 0 || done === MAX_PAGES) {
+        console.log(
+          `[${SOURCE}:filmes] ${done}/${MAX_PAGES} ` +
+          `(${((Date.now() - t0) / 1000).toFixed(1)}s)`
+        );
+      }
     }
   }
 
-  // dedupe por (label + imdbId) — mantém só o primeiro
-  const seen = new Set();
-  const uniquePlayers = [];
-  for (const p of players) {
-    const key = `${p.label}::${p.imdbId || p.player}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    uniquePlayers.push(p);
-  }
-
-  const imdbId = uniquePlayers.length && uniquePlayers[0].imdbId
-    ? uniquePlayers[0].imdbId
-    : null;
-
-  return {
-    id: postId || null,
-    imdbId,
-    title: title ? decodeHtml(title) : null,
-    originalTitle: originalTitle ? decodeHtml(originalTitle) : null,
-    year,
-    releaseDate: releaseDate ? decodeHtml(releaseDate) : null,
-    runtime,
-    rating: rating ? Number(String(rating).replace(',', '.')) : null,
-    ratingCount: ratingCount ? Number(ratingCount) : null,
-    poster: absUrl(pageUrl, poster),
-    backdrop: absUrl(pageUrl, backdrop),
-    overview: overview || null,
-    genres,
-    trailerUrl: trailerUrl || null,
-    players: uniquePlayers,
-    pageUrl,
-  };
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  console.log(
+    `[${SOURCE}:filmes] DONE ${items.length} itens em ` +
+    `${((Date.now() - t0) / 1000).toFixed(1)}s`
+  );
+  return items;
 }
 
-/* ───────────────── resolve ───────────────── */
+// ---------- Cache ----------
+let cacheData = null;
+let cacheAt = 0;
+let running = null;
 
-async function resolveMovie(raw) {
-  if (!raw) {
-    const e = new Error('URL do filme ausente');
-    e.status = 400;
-    throw e;
-  }
+async function getAll() {
+  if (cacheData && Date.now() - cacheAt < CACHE_TTL) return cacheData;
+  if (running) return running;
 
-  // ─── ViewPlayer direto ───
-  if (/viewplayer\.online/i.test(raw)) {
-    const imdbM = raw.match(/tt\d+/);
-    if (!imdbM) {
-      const e = new Error(
-        'Não foi possível extrair o IMDb ID da URL do ViewPlayer (esperado tt\\d+)'
-      );
-      e.status = 400;
-      throw e;
+  running = (async () => {
+    try {
+      const data = await scrapeAll();
+      cacheData = data;
+      cacheAt = Date.now();
+      return data;
+    } finally {
+      running = null;
     }
-    const imdbId = imdbM[0];
-    return {
-      success: true,
-      type: 'movie',
-      source: 'megacine',
-      id: null,
-      imdbId,
-      title: null,
-      originalTitle: null,
-      year: null,
-      releaseDate: null,
-      runtime: null,
-      rating: null,
-      ratingCount: null,
-      poster: null,
-      backdrop: null,
-      overview: null,
-      genres: [],
-      trailerUrl: null,
-      pageUrl: raw,
-      player: moviePlayerUrl(imdbId),
-      players: [
-        {
-          nume: '1',
-          label: 'PRINCIPAL',
-          player: moviePlayerUrl(imdbId),
-          imdbId,
-        },
-      ],
-    };
-  }
+  })();
 
-  // ─── Página do MegaCine ───
-  const pageUrl = buildPageUrl(raw);
-  const html = await getHtml(pageUrl, { Referer: MEGACINE + '/' });
-  const meta = parseMegaCineMovie(html, pageUrl);
-
-  if (!meta.players.length) {
-    const e = new Error(
-      'Nenhum player do ViewPlayer encontrado nesta página (talvez seja só trailer ou página de série)'
-    );
-    e.status = 404;
-    throw e;
-  }
-
-  // Reforça o player canônico caso a página use uma URL “suja”
-  for (const p of meta.players) {
-    if (p.imdbId) p.player = moviePlayerUrl(p.imdbId);
-  }
-
-  const primary = meta.players[0];
-
-  return {
-    success: true,
-    type: 'movie',
-    source: 'megacine',
-    id: meta.id,
-    imdbId: meta.imdbId || primary.imdbId,
-    title: meta.title,
-    originalTitle: meta.originalTitle,
-    year: meta.year,
-    releaseDate: meta.releaseDate,
-    runtime: meta.runtime,
-    rating: meta.rating,
-    ratingCount: meta.ratingCount,
-    poster: meta.poster,
-    backdrop: meta.backdrop,
-    overview: meta.overview,
-    genres: meta.genres,
-    trailerUrl: meta.trailerUrl,
-    pageUrl: meta.pageUrl,
-    /** atalho: primeiro player (PRINCIPAL) */
-    player: primary.player,
-    /** lista completa (Dublado / Legendado / HD / …) */
-    players: meta.players,
-    /**
-     * Como usar no app:
-     *   data.players[i].player  →  /video?url=...
-     */
-  };
+  return running;
 }
 
-/* ───────────────── handler ───────────────── */
+// ---------- API pública ----------
+async function getTopfilmesFilmes() {
+  const data = await getAll();
+  return { success: true, data };
+}
 
 async function handler(req, res) {
-  const reply = res;
   try {
-    const raw = rawFromReq(req);
-    if (!raw) {
-      const body = {
-        success: false,
-        error: 'Envie a URL do filme em /filme/{url} ou ?url=',
-      };
-      if (typeof reply.status === 'function') {
-        const r = reply.status(400);
-        return typeof r.send === 'function' && !r.json ? r.send(body) : r.json(body);
-      }
-      reply.statusCode = 400;
-      return reply.end(JSON.stringify(body));
+    if (req && req.query && req.query.refresh === '1') {
+      cacheData = null;
+      cacheAt = 0;
     }
-
-    const data = await resolveMovie(raw);
-
-    if (typeof reply.send === 'function' && !reply.json) return reply.send(data);
-    if (typeof reply.json === 'function') return reply.json(data);
-    reply.end(JSON.stringify(data));
+    const json = await getTopfilmesFilmes();
+    res.json(json);
   } catch (err) {
-    const status = err.status || 500;
-    const body = { success: false, error: err.message || 'Falha ao resolver filme' };
-    if (typeof reply.status === 'function') {
-      const r = reply.status(status);
-      if (typeof r.send === 'function' && !r.json) return r.send(body);
-      if (typeof r.json === 'function') return r.json(body);
-    }
-    if (typeof reply.code === 'function') return reply.code(status).send(body);
-    reply.statusCode = status;
-    reply.end(JSON.stringify(body));
+    console.error(`[${SOURCE}:filmes] error:`, err);
+    res.status(500).json({ success: false, error: err.message });
   }
 }
 
-async function getMovie(movieUrl) {
-  return resolveMovie(String(movieUrl || '').trim());
-}
-
-module.exports = {
-  handler,
-  getMovie,
-  resolveMovie,
-  parseMegaCineMovie,
-  moviePlayerUrl,
-};
+module.exports = { handler, getTopfilmesFilmes };
