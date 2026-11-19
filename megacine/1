@@ -1,0 +1,39 @@
+//url base https://megacine.yachts/
+
+//filme 
+
+https://megacine.yachts/filmes/assistir-a-odisseia-online
+
+// pega o player do html
+
+<div id='source-player-1' class='source-box'>
+<div class='pframe'>
+<iframe class='metaframe rptss' src='https://viewplayer.online/filme/tt33764258' frameborder='0' scrolling='no' allow='autoplay; encrypted-media' allowfullscreen aria-label='player-do-filme'></iframe>
+</div>
+
+//chama a url do player
+https://viewplayer.online/filme/tt33764258
+
+//pega a url primeira e dublada
+
+<span class="player-option__content"><strong>#1 Dublado</strong>
+																																</span>
+																													</button>
+																										<button
+										type="button"
+										class="player-option"
+										data-show-player="true"
+										data-audio="dubbed"
+										data-source="https://bysebuho.com/e/jrurapf5nqdk"
+										data-subtitles=""
+										data-type="iframe"
+										data-id="495630"
+										data-no-download="0"
+									>
+
+ 
+data-source="https://bysebuho.com/e/jrurapf5nqdk"
+
+//chama https://bysebuho.com/e/jrurapf5nqdk
+
+
