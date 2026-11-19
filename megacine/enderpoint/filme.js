@@ -4,7 +4,7 @@
  *
  * Fonte: topfilmes.biz — seção "Últimos Filmes Adicionados" da home (/home)
  * Paginação: 1 → 151  (via /home?p=N)
- * Play prefix: https://api.tedflix.site/v4/play/
+ * Link: URL crua (https://topfilmes.biz/assistir/<slug>) — sem prefixo de API
  * Cache: 24h
  *
  * Express / Fastify:
@@ -22,8 +22,6 @@ const NodeHttp = require('http');
 
 // ---------- Config ----------
 const BASE = (process.env.TOPFILMES_URL || 'https://topfilmes.biz').replace(/\/+$/, '');
-const PUBLIC_API = (process.env.PUBLIC_API_BASE || 'https://api.tedflix.site').replace(/\/+$/, '');
-const PLAY_PREFIX = `${PUBLIC_API}/v4/play/`;
 
 const SOURCE = 'topfilmes';
 const MAX_PAGES = 151;
@@ -90,7 +88,7 @@ function parsePage(html) {
       title,
       year,
       rating,
-      link: PLAY_PREFIX + absUrl(href),
+      link: absUrl(href), // URL crua do topfilmes
       cover,
       source: SOURCE,
     });
@@ -183,9 +181,7 @@ async function getAll() {
   return running;
 }
 
-
- // ---------- API pública ----------
-
+// ---------- API pública ----------
 async function getTopfilmesFilmes() {
   const data = await getAll();
   return { success: true, data };
