@@ -4,7 +4,7 @@
  *
  * Fonte: megacine.yachts — listagem "Adicionados recentemente" de séries
  * Paginação: /series (p.1) → /series/page/117 (p.117)
- * Play prefix: https://api.tedflix.site/v1/play/
+ * Link: URL crua (https://megacine.yachts/series/assistir-...) — sem prefixo de API
  * Cache: 9h
  *
  * Express / Fastify:
@@ -22,8 +22,6 @@ const NodeHttp = require('http');
 
 // ---------- Config ----------
 const BASE = (process.env.MEGACINE_URL || 'https://megacine.yachts').replace(/\/+$/, '');
-const PUBLIC_API = (process.env.PUBLIC_API_BASE || 'https://api.tedflix.site').replace(/\/+$/, '');
-const PLAY_PREFIX = `${PUBLIC_API}/v1/play/`;
 
 const SOURCE = 'megacine';
 const MAX_PAGES = 117;
@@ -104,7 +102,7 @@ function parsePage(html) {
       title,
       year,
       rating: null, // padrão megacine — sem nota
-      link: PLAY_PREFIX + absUrl(href),
+      link: absUrl(href), // URL crua do megacine
       cover,
       source: SOURCE,
     });
