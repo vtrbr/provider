@@ -90,6 +90,15 @@ async function getText(url, headers = {}) {
   return res.text;
 }
 
+function publicBase(req) {
+  const env = (process.env.PUBLIC_API_BASE || '').replace(/\/+$/, '');
+  if (env) return env;
+  const host =
+    (req && (req.headers['x-forwarded-host'] || req.headers.host)) || 'localhost:1100';
+  const proto = (req && req.headers['x-forwarded-proto']) || 'http';
+  return `${proto}://${host}`;
+}
+
 /* ───────────────── helpers ───────────────── */
 
 function b64urlToBuf(s) {
@@ -104,7 +113,9 @@ function extractByseCode(input) {
   const s = String(input || '').trim();
   let m = s.match(/\/e\/([a-zA-Z0-9]{6,})/i);
   if (m) return m[1];
-  m = s.match(/(?:bysebuho\.com|n1mwq\.org|byse\.sx)\/(?:[a-z0-9]+\/)?([a-zA-Z0-9]{8,})/i);
+  m = s.match(
+    /(?:bysebuho\.com|n1mwq\.org|byse\.sx|embedplaybyse\.top)\/(?:[a-z0-9]+\/)?([a-zA-Z0-9]{8,})/i
+  );
   if (m) return m[1];
   if (/^[a-zA-Z0-9]{8,20}$/.test(s)) return s;
   return null;
@@ -129,7 +140,9 @@ function rawFromReq(req) {
   let raw = candidates[0] ? String(candidates[0]) : '';
 
   if (!raw && req.originalUrl) {
-    const m = String(req.originalUrl).match(/\/(?:video(?:\/v1)?|play\/v1)\/(.+?)(?:\?|$)/i);
+    const m = String(req.originalUrl).match(
+      /\/(?:video(?:\/v1)?|play\/v1)\/(.+?)(?:\?|$)/i
+    );
     if (m) raw = m[1];
   }
   if (!raw && req.url) {
@@ -197,7 +210,9 @@ async function resolveByseCode(code) {
     data.file ||
     data.url ||
     data.stream ||
-    (Array.isArray(data.sources) && data.sources[0] && (data.sources[0].url || data.sources[0].file));
+    (Array.isArray(data.sources) &&
+      data.sources[0] &&
+      (data.sources[0].url || data.sources[0].file));
 
   if (plain && /^https?:\/\//i.test(String(plain))) {
     return {
@@ -215,15 +230,21 @@ async function resolveByseCode(code) {
 
   const dec = decryptPlayback(data.playback);
   const sources = Array.isArray(dec.sources) ? dec.sources : [];
-  if (!sources.length || !sources[0].url) throw new Error('Byse: nenhuma source após decrypt');
+  if (!sources.length || !sources[0].url) {
+    throw new Error('Byse: nenhuma source após decrypt');
+  }
 
-  const ranked = [...sources].sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
+  const ranked = [...sources].sort(
+    (a, b) => (Number(b.height) || 0) - (Number(a.height) || 0)
+  );
   const best = ranked[0];
   const url = String(best.url).replace(/\\u0026/g, '&');
 
   return {
     url,
-    format: formatOf(url) || (String(best.mime_type || '').includes('mpegurl') ? 'hls' : 'mp4'),
+    format:
+      formatOf(url) ||
+      (String(best.mime_type || '').includes('mpegurl') ? 'hls' : 'mp4'),
     quality: best.label || (best.height ? `${best.height}p` : null),
     title: data.title || null,
     expiresAt: dec.expires_at || data.playback.expires_at || null,
@@ -266,15 +287,14 @@ function parseViewPlayerSources(html) {
   return out;
 }
 
-async function resolveViewPlayer(url) {
+async function resolveViewPlayer(url, req) {
   const html = await getText(url, { Referer: 'https://megacine.yachts/' });
   const options = parseViewPlayerSources(html);
   if (!options.length) throw new Error('ViewPlayer: nenhum data-source');
 
-  // PRIORIDADE: Byse primeiro (stream real m3u8), depois Abyss, depois direto
   const score = (o) => {
     const s = o.src || '';
-    if (/bysebuho|byse\.sx|n1mwq/i.test(s)) return 0;
+    if (/bysebuho|byse\.sx|n1mwq|embedplaybyse/i.test(s)) return 0;
     if (/\.m3u8|\.mp4/i.test(s)) return 1;
     if (/abyssplayer/i.test(s)) return 2;
     if (/voe\.sx/i.test(s)) return 3;
@@ -283,7 +303,7 @@ async function resolveViewPlayer(url) {
 
   const ordered = [
     ...options.filter((o) => /dub/i.test(o.audio)).sort((a, b) => score(a) - score(b)),
-    ...options.sort((a, b) => score(a) - score(b)),
+    ...[...options].sort((a, b) => score(a) - score(b)),
   ];
 
   const tried = new Set();
@@ -293,9 +313,8 @@ async function resolveViewPlayer(url) {
     if (tried.has(opt.src)) continue;
     tried.add(opt.src);
 
-    // 1) Byse
     const code = extractByseCode(opt.src);
-    if (code && /bysebuho|byse\.sx|n1mwq|\/e\//i.test(opt.src)) {
+    if (code && /bysebuho|byse\.sx|n1mwq|embedplaybyse|\/e\//i.test(opt.src)) {
       try {
         const stream = await resolveByseCode(code);
         return { ...stream, playerSource: opt.src, audio: opt.audio || null };
@@ -305,7 +324,6 @@ async function resolveViewPlayer(url) {
       }
     }
 
-    // 2) URL direta
     if (/\.m3u8|\.mp4/i.test(opt.src)) {
       return {
         url: opt.src,
@@ -320,10 +338,9 @@ async function resolveViewPlayer(url) {
       };
     }
 
-    // 3) Abyss por último (player proprietário com chunks)
     if (/abyssplayer\.com/i.test(opt.src)) {
       try {
-        return await resolveAbyssPlayer(opt.src);
+        return await resolveAbyssPlayer(opt.src, req);
       } catch (e) {
         lastErr = e;
         continue;
@@ -334,28 +351,20 @@ async function resolveViewPlayer(url) {
   throw lastErr || new Error('ViewPlayer: nenhum source resolveu stream');
 }
 
-/* ───────────────── AbyssPlayer ─────────────────
- *
- * Fluxo real (investigado):
- * 1. HTML contém `datas` em Base64 → JSON { slug, md5_id, user_id, media: <binário cifrado>, config }
- * 2. window.SoTrym(JSON.parse(atob(datas))) no lite.bundle.js (iamcdn)
- * 3. `media` é decifrado com WebCrypto AES-CTR → metadados de qualities
- * 4. JWPlayer recebe sources tipo:
- *    https://storage.googleapis.com/mediastorage/{ts}/{rand}/{size}.mp4#mp4/chunk/1/{size}/2097152/{label}/{codec}?maxChunkSize=...
- * 5. Service Worker (sw.bundle.v3.js) intercepta o fetch e serve chunks cifrados
- *    → URL GCS pura responde 403 fora do player
- *
- * Limite: sem emular o SW/AES do iamcdn, não há MP4 progressivo estável.
- * Quando o ViewPlayer também oferece Byse, usamos Byse (prioridade acima).
- * Aqui tentamos extrair o máximo de metadados e falhamos com erro claro.
- */
+/* ───────────────── Abyss player limpo (sem anúncio) ───────────────── */
+
+function extractAbyssDatasB64(html) {
+  const m = String(html || '').match(
+    /(?:const|var|let)\s+datas\s*=\s*"([A-Za-z0-9+/=]+)"/
+  );
+  return m ? m[1] : null;
+}
 
 function parseAbyssDatas(html) {
-  const m = html.match(/(?:const|var|let)\s+datas\s*=\s*"([A-Za-z0-9+/=]+)"/);
-  if (!m) return null;
+  const b64 = extractAbyssDatasB64(html);
+  if (!b64) return null;
   try {
-    const raw = Buffer.from(m[1], 'base64');
-    // JSON com campo media binário: parse manual
+    const raw = Buffer.from(b64, 'base64');
     const text = raw.toString('latin1');
     const slugM = text.match(/"slug"\s*:\s*"([^"]+)"/);
     const md5M = text.match(/"md5_id"\s*:\s*(\d+)/);
@@ -367,6 +376,7 @@ function parseAbyssDatas(html) {
       user_id: userM ? Number(userM[1]) : null,
       title: titleM ? titleM[1].trim() : null,
       poster: slugM ? `https://img.freeimagecdn.net/image/${slugM[1]}.jpg` : null,
+      datas: b64,
       rawLen: raw.length,
     };
   } catch {
@@ -374,18 +384,63 @@ function parseAbyssDatas(html) {
   }
 }
 
-async function resolveAbyssPlayer(playerUrl) {
+function buildCleanPlayerHtml(datasB64, title) {
+  const safeTitle = String(title || 'Player')
+    .replace(/</g, '')
+    .replace(/>/g, '')
+    .replace(/"/g, '');
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex,nofollow">
+  <title>${safeTitle}</title>
+  <style>
+    *{margin:0;padding:0} html,body{height:100%;background:#000;overflow:hidden}
+    #player{width:100%;height:100%}
+    .loader{display:flex;justify-content:center;align-items:center;height:100vh}
+    .loader span{border:6px solid #333;border-top:6px solid #3498db;border-radius:50%;width:36px;height:36px;animation:spin 1s linear infinite}
+    @keyframes spin{to{transform:rotate(360deg)}}
+  </style>
+  <script src="https://iamcdn.net/player/jwplayer.min.js"></script>
+  <script src="https://iamcdn.net/player/jwpsrv.js"></script>
+  <script src="https://iamcdn.net/player/jwplayer.core.controls.html5.js"></script>
+  <script src="https://iamcdn.net/player/stretch-plugin-settings.min.js"></script>
+  <script src="https://iamcdn.net/player-v2/core.bundle.js"></script>
+</head>
+<body>
+  <div id="player"><div class="loader"><span></span></div></div>
+  <script>
+    (function(){
+      var datas = "${datasB64}";
+      function boot(){
+        try {
+          var payload = JSON.parse(atob(datas));
+          if (window.SoTrym) return window.SoTrym(payload);
+        } catch (e) {
+          document.body.innerHTML = '<p style="color:#fff;padding:20px;font-family:sans-serif">Falha ao iniciar player: '+(e.message||e)+'</p>';
+        }
+      }
+      if (window.SoTrym) return boot();
+      var s = document.createElement('script');
+      s.src = 'https://iamcdn.net/player-v2/lite.bundle.js';
+      s.onload = boot;
+      s.onerror = function(){ document.body.innerHTML = '<p style="color:#fff;padding:20px">Falha ao carregar engine do player.</p>'; };
+      document.head.appendChild(s);
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+async function resolveAbyssPlayer(playerUrl, req) {
   const id = extractAbyssId(playerUrl) || playerUrl;
-  const pageUrl = /^https?:\/\//i.test(playerUrl)
-    ? playerUrl
-    : `${ABYSS}/${id}`;
+  const pageUrl = /^https?:\/\//i.test(playerUrl) ? playerUrl : `${ABYSS}/${id}`;
 
   const res = await request(pageUrl, {
     accept: 'text/html',
-    headers: {
-      Referer: 'https://viewplayer.online/',
-      // simula iframe (o player redireciona se top==self)
-    },
+    headers: { Referer: 'https://viewplayer.online/' },
   });
 
   if (res.status >= 400) {
@@ -397,7 +452,6 @@ async function resolveAbyssPlayer(playerUrl) {
   const html = res.text || '';
   const meta = parseAbyssDatas(html);
 
-  // Tentar achar qualquer URL direta rara (alguns embeds legados)
   const patterns = [
     /["'](https?:\/\/storage\.googleapis\.com\/mediastorage\/[^"']+\.mp4[^"']*)["']/i,
     /["'](https?:\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i,
@@ -405,8 +459,7 @@ async function resolveAbyssPlayer(playerUrl) {
   for (const re of patterns) {
     const m = html.match(re);
     if (m) {
-      let url = m[1].replace(/\\/g, '');
-      // remover hash de chunk protocol se for só metadado
+      const url = m[1].replace(/\\/g, '');
       return {
         url,
         format: formatOf(url),
@@ -422,47 +475,112 @@ async function resolveAbyssPlayer(playerUrl) {
     }
   }
 
-  // Abyss moderno: stream só via Service Worker + AES-CTR (não é MP4 direto)
-  const e = new Error(
-    'AbyssPlayer: stream protegido (GCS + SW chunks). ' +
-      'Use o source Byse do mesmo episódio quando existir. ' +
-      (meta && meta.slug ? 'slug=' + meta.slug : '')
-  );
-  e.status = 422;
-  e.abyss = meta;
-  throw e;
+  // Player limpo na nossa API (sem anúncio)
+  if (!meta || !meta.datas) {
+    const e = new Error(
+      'AbyssPlayer: datas ausente' + (meta && meta.slug ? ' slug=' + meta.slug : '')
+    );
+    e.status = 422;
+    e.abyss = meta;
+    throw e;
+  }
+
+  const slug = meta.slug || id;
+  const base = publicBase(req);
+  const cleanUrl = `${base}/player/abyss/${encodeURIComponent(slug)}`;
+
+  return {
+    url: cleanUrl,
+    directUrl: pageUrl,
+    format: 'iframe',
+    quality: null,
+    title: meta.title || null,
+    expiresAt: null,
+    sources: [{ url: cleanUrl, type: 'iframe' }],
+    headers: {},
+    playerSource: pageUrl,
+    audio: null,
+    abyss: { slug, cleanPlayer: true, poster: meta.poster || null },
+  };
 }
 
+/** GET /player/abyss/:slug  → HTML limpo */
+async function abyssPlayerHandler(req, res) {
+  try {
+    let raw =
+      (req.query && (req.query.u || req.query.url || req.query.v || req.query.slug)) ||
+      (req.params && (req.params[0] || req.params.slug)) ||
+      '';
+    try {
+      raw = decodeURIComponent(String(raw).trim());
+    } catch {
+      raw = String(raw).trim();
+    }
+    if (!raw && req.url) {
+      const m = String(req.url).match(/\/player\/abyss\/?(.+?)(?:\?|$)/i);
+      if (m) {
+        try {
+          raw = decodeURIComponent(m[1]);
+        } catch {
+          raw = m[1];
+        }
+      }
+    }
+    if (!raw) {
+      res.statusCode = 400;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify({ success: false, error: 'Falta slug/url Abyss' }));
+    }
 
-/* ───────────────── EmbedPlay API (só BYSE) ─────────────────
- * embedplayapi.top/embed/{imdb|slug}
- *   → GET ajax/get_stream_link?id=&movie=
- *   → embedplay.vip/filme|serie/...
- *   → POST /api action=getPlayer&video_id=  (só opções BYSE)
- *   → embedplaybyse.top/e/{code} → resolveByseCode
- */
+    const pageUrl = /^https?:\/\//i.test(raw) ? raw : `${ABYSS}/${raw}`;
+    const page = await request(pageUrl, {
+      accept: 'text/html',
+      headers: { Referer: 'https://viewplayer.online/' },
+    });
+    if (page.status >= 400) {
+      res.statusCode = page.status;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify({ success: false, error: 'Abyss HTTP ' + page.status }));
+    }
 
-function extractImdbFromUrl(u) {
-  const m = String(u || '').match(/\b(tt\d{5,})\b/i);
-  return m ? m[1] : null;
+    const datas = extractAbyssDatasB64(page.text);
+    if (!datas) {
+      res.statusCode = 404;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify({ success: false, error: 'datas não encontrado' }));
+    }
+
+    const titleM = page.text.match(/<title>([^<]+)<\/title>/i);
+    const html = buildCleanPlayerHtml(datas, titleM ? titleM[1].trim() : 'Player');
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=120');
+    res.setHeader('Content-Security-Policy', 'frame-ancestors *');
+    return res.end(html);
+  } catch (err) {
+    res.statusCode = err.status || 500;
+    res.setHeader('Content-Type', 'application/json');
+    return res.end(
+      JSON.stringify({ success: false, error: err.message || 'player abyss falhou' })
+    );
+  }
 }
+
+/* ───────────────── EmbedPlay API (só BYSE) ───────────────── */
 
 async function resolveEmbedPlayByse(pageUrl) {
   const home = 'https://embedplay.vip';
-  const html = await getText(pageUrl, {
-    Referer: 'https://embedplayapi.top/',
-  });
+  const html = await getText(pageUrl, { Referer: 'https://embedplayapi.top/' });
 
-  // Coletar players: preferir nome com BYSE
   const items = [];
-  const re = /class="player_select_item"[^>]*data-id="(\d+)"[\s\S]{0,400}?class="player_select_name"[^>]*>([\s\S]*?)<\//gi;
+  const re =
+    /class="player_select_item"[^>]*data-id="(\d+)"[\s\S]{0,400}?class="player_select_name"[^>]*>([\s\S]*?)<\//gi;
   let m;
   while ((m = re.exec(html))) {
     const id = m[1];
     const name = String(m[2] || '').replace(/\s+/g, ' ').trim();
     items.push({ id, name, isByse: /byse/i.test(name) });
   }
-  // fallback: qualquer data-id numérico em player_select_item
   if (!items.length) {
     const re2 = /player_select_item[^>]*data-id="(\d+)"/gi;
     while ((m = re2.exec(html))) items.push({ id: m[1], name: '', isByse: false });
@@ -500,7 +618,6 @@ async function resolveEmbedPlayByse(pageUrl) {
         null;
       if (!videoUrl) throw new Error('EmbedPlay api sem video_url');
 
-      // Só aceitar BYSE / byse-like; pular abyss
       if (/abyss|embedplayabyss/i.test(videoUrl) && !/byse|embedplaybyse/i.test(videoUrl)) {
         lastErr = new Error('EmbedPlay: source Abyss ignorado (' + it.name + ')');
         continue;
@@ -508,7 +625,6 @@ async function resolveEmbedPlayByse(pageUrl) {
 
       const code = extractByseCode(videoUrl);
       if (!code) {
-        // URL direta?
         if (/\.m3u8|\.mp4/i.test(videoUrl)) {
           return {
             url: videoUrl,
@@ -530,7 +646,11 @@ async function resolveEmbedPlayByse(pageUrl) {
       return {
         ...stream,
         playerSource: videoUrl,
-        audio: /leg/i.test(it.name) ? 'legendado' : /dub/i.test(it.name) ? 'dublado' : stream.audio || null,
+        audio: /leg/i.test(it.name)
+          ? 'legendado'
+          : /dub/i.test(it.name)
+            ? 'dublado'
+            : stream.audio || null,
         embedPlay: { videoId: it.id, name: it.name, pageUrl },
       };
     } catch (e) {
@@ -543,30 +663,25 @@ async function resolveEmbedPlayByse(pageUrl) {
 }
 
 async function resolveEmbedPlayApi(embedUrl) {
-  // 1) Página do embed
-  const html = await getText(embedUrl, {
-    Referer: 'https://megacine.yachts/',
-  });
+  const html = await getText(embedUrl, { Referer: 'https://megacine.yachts/' });
 
   const movieIdM = html.match(/data-movie-id=["']([^"']+)["']/i);
   const movieId = movieIdM ? movieIdM[1] : null;
   if (!movieId) {
-    // talvez já seja embedplay.vip
     if (/embedplay\.vip/i.test(embedUrl)) return resolveEmbedPlayByse(embedUrl);
     const e = new Error('EmbedPlayAPI: data-movie-id não encontrado');
     e.status = 404;
     throw e;
   }
 
-  // servers
   const serverIds = [];
-  const reSrv = /class="server[^"]*"[^>]*data-id=["']([^"']+)["']|data-id=["']([^"']+)["'][^>]*class="[^"]*server/gi;
+  const reSrv =
+    /class="server[^"]*"[^>]*data-id=["']([^"']+)["']|data-id=["']([^"']+)["'][^>]*class="[^"]*server/gi;
   let m;
   while ((m = reSrv.exec(html))) {
     const id = m[1] || m[2];
     if (id && id !== '_default') serverIds.push(id);
   }
-  // fallback genérico
   if (!serverIds.length) {
     const all = [...html.matchAll(/data-id=["']([A-Za-z0-9_-]{3,})["']/g)].map((x) => x[1]);
     for (const id of all) {
@@ -613,10 +728,9 @@ async function resolveEmbedPlayApi(embedUrl) {
   return resolveEmbedPlayByse(pageLink);
 }
 
-
 /* ───────────────── resolve ───────────────── */
 
-async function resolvePlayer(raw) {
+async function resolvePlayer(raw, req) {
   if (!raw) {
     const e = new Error('URL do player ausente');
     e.status = 400;
@@ -635,14 +749,19 @@ async function resolvePlayer(raw) {
     };
   }
 
-  // Byse direto
   const byseCode = extractByseCode(raw);
-  if (byseCode && (/bysebuho|byse\.sx|n1mwq|\/e\//i.test(raw) || /^[a-zA-Z0-9]{8,20}$/.test(raw))) {
+  if (
+    byseCode &&
+    (/bysebuho|byse\.sx|n1mwq|embedplaybyse|\/e\//i.test(raw) ||
+      /^[a-zA-Z0-9]{8,20}$/.test(raw))
+  ) {
     return resolveByseCode(byseCode);
   }
 
-  // EmbedPlay API (BYSE only)
-  if (/embedplayapi\.top/i.test(raw) || /embedplay\.vip\/(filme|serie|series|tv|embed)/i.test(raw)) {
+  if (
+    /embedplayapi\.top/i.test(raw) ||
+    /embedplay\.vip\/(filme|serie|series|tv|embed)/i.test(raw)
+  ) {
     return resolveEmbedPlayApi(raw);
   }
   if (/embedplaybyse\.top/i.test(raw)) {
@@ -650,32 +769,29 @@ async function resolvePlayer(raw) {
     if (c) return resolveByseCode(c);
   }
 
-  // ViewPlayer
-  if (/viewplayer\.online/i.test(raw)) return resolveViewPlayer(raw);
+  if (/viewplayer\.online/i.test(raw)) return resolveViewPlayer(raw, req);
 
-  // Abyss
-  if (/abyssplayer\.com/i.test(raw)) return resolveAbyssPlayer(raw);
+  if (/abyssplayer\.com/i.test(raw)) return resolveAbyssPlayer(raw, req);
 
-  // fallback: tentar byse code solto
   if (byseCode) {
     try {
       return await resolveByseCode(byseCode);
     } catch (_) {}
   }
 
-  // página genérica
   const html = await getText(raw);
   const options = parseViewPlayerSources(html);
   const hrefs = String(html).match(/https?:\/\/[^\s"'<>]+/gi) || [];
   const candidates = [
     ...options.map((o) => o.src),
-    ...hrefs.filter((u) => /bysebuho|abyssplayer|\/e\/[a-z0-9]+|\.m3u8|\.mp4|viewplayer/i.test(u)),
+    ...hrefs.filter((u) =>
+      /bysebuho|abyssplayer|\/e\/[a-z0-9]+|\.m3u8|\.mp4|viewplayer/i.test(u)
+    ),
   ];
 
-  // byse first
   for (const src of [...new Set(candidates)]) {
     const c = extractByseCode(src);
-    if (c && /bysebuho|\/e\//i.test(src)) {
+    if (c && /bysebuho|embedplaybyse|\/e\//i.test(src)) {
       try {
         return await resolveByseCode(c);
       } catch (_) {}
@@ -697,7 +813,7 @@ async function resolvePlayer(raw) {
   for (const src of [...new Set(candidates)]) {
     if (/abyssplayer\.com/i.test(src)) {
       try {
-        return await resolveAbyssPlayer(src);
+        return await resolveAbyssPlayer(src, req);
       } catch (_) {}
     }
   }
@@ -707,14 +823,17 @@ async function resolvePlayer(raw) {
   throw e;
 }
 
-/* ───────────────── handler ───────────────── */
+/* ───────────────── handler /play/v1 ───────────────── */
 
 async function handler(req, res) {
   const reply = res;
   try {
     const raw = rawFromReq(req);
     if (!raw) {
-      const body = { success: false, error: 'Envie a URL do player em /video/{url} ou ?url=' };
+      const body = {
+        success: false,
+        error: 'Envie a URL do player em /video/{url} ou ?url=',
+      };
       if (typeof reply.status === 'function') {
         const r = reply.status(400);
         return typeof r.send === 'function' && !r.json ? r.send(body) : r.json(body);
@@ -723,11 +842,10 @@ async function handler(req, res) {
       return reply.end(JSON.stringify(body));
     }
 
-    const stream = await resolvePlayer(raw);
+    const stream = await resolvePlayer(raw, req);
     const referer = (stream.headers && stream.headers.Referer) || '';
     const directUrl = stream.url;
 
-    // proxy HLS se disponível
     let url = directUrl;
     let proxied = false;
     try {
@@ -751,6 +869,7 @@ async function handler(req, res) {
       sources: stream.sources || [{ url: directUrl }],
       player: raw,
       audio: stream.audio || null,
+      abyss: stream.abyss || undefined,
     };
 
     if (typeof reply.send === 'function' && !reply.json) return reply.send(body);
@@ -773,8 +892,8 @@ async function handler(req, res) {
   }
 }
 
-async function getVideo(playerUrl) {
-  return resolvePlayer(String(playerUrl || '').trim());
+async function getVideo(playerUrl, req) {
+  return resolvePlayer(String(playerUrl || '').trim(), req || null);
 }
 
 module.exports = {
@@ -786,6 +905,7 @@ module.exports = {
   resolveAbyssPlayer,
   resolveEmbedPlayApi,
   resolveEmbedPlayByse,
+  abyssPlayerHandler,
   decryptPlayback,
   extractByseCode,
   extractAbyssId,
