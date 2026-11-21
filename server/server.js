@@ -51,7 +51,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'tedflix-provider',
-    version: '4.2.0',
+    version: '4.2.1',
     port: PORT,
     uptime: process.uptime(),
   });
@@ -61,7 +61,7 @@ app.get('/', (_req, res) => {
   res.json({
     success: true,
     service: 'TEDFLIX Provider API',
-    version: '4.2.0',
+    version: '4.2.1',
     port: PORT,
     routes: {
       banner: '/banner',
@@ -73,6 +73,7 @@ app.get('/', (_req, res) => {
       detalheSerie: '/detalhe/v1/*',
       detalheFilme: '/detalhe/v2/*',
       proxyHls: '/proxy/hls?u=',
+      playerAbyss: '/player/abyss/:slug',
       playMegacine: '/play/v1/*',
       playTopfilmes: '/play/v2/*',
     },
@@ -143,7 +144,6 @@ app.get('/categorias', (_req, res) => {
 });
 
 // ───────────── detalhes ─────────────
-// /detalhe/v1/* → série MegaCine
 try {
   const detalheSerie = require('./detalhes/detalhe-serie');
   mountWildcard('/detalhe/v1', detalheSerie.handler);
@@ -152,7 +152,6 @@ try {
   console.warn('[boot] detalhe-serie:', e.message);
 }
 
-// /detalhe/v2/* → filme TopFilmes
 try {
   const detalheFilme = require('./detalhes/detalhe-filme');
   mountWildcard('/detalhe/v2', detalheFilme.handler);
@@ -170,40 +169,18 @@ try {
   console.warn('[boot] hls-proxy:', e.message);
 }
 
-// ───────────── play / video ─────────────
-// /play/v1/* → player MegaCine (séries / byse)
+// ───────────── Abyss player limpo (sem anúncio) ─────────────
 try {
   const playV1 = require('./video/mega-video');
-  mountWildcard('/play/v1', playV1.handler);
-  mountWildcard('/video/v1', playV1.handler);
-  console.log('[boot] /play/v1 → megacine video');
-} catch (e) {
-  console.warn('[boot] play/v1:', e.message);
-}
 
-// /play/v2/* → player TopFilmes (MP4)
-try {
-  const playV2 = require('./video/video-top');
-  mountWildcard('/play/v2', playV2.handler);
-  mountWildcard('/video/v2', playV2.handler);
-  console.log('[boot] /play/v2 → topfilmes video');
-} catch (e) {
-  console.warn('[boot] play/v2:', e.message);
-}
+  app.get('/player/abyss', (req, res) => playV1.abyssPlayerHandler(req, res));
 
-// ───────────── 404 ─────────────
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Rota não encontrada',
-    path: req.path,
+  app.get('/player/abyss/:slug', (req, res) => {
+    req.params = req.params || {};
+    req.params[0] = req.params.slug;
+    return playV1.abyssPlayerHandler(req, res);
   });
-});
 
-app.listen(PORT, HOST, () => {
-  console.log('══════════════════════════════════════════════════');
-  console.log('  TEDFLIX Provider  v4.2.0');
-  console.log(`  http://${HOST}:${PORT}`);
-  console.log(`  categorias: ${mounted.join(', ')}`);
-  console.log('══════════════════════════════════════════════════');
-});
+  app.get('/player/abyss/*', (req, res) => {
+    const rest = (req.path || '').replace(/^\/player\/abyss\/?/, '');
+    req.params = req.params || {};
