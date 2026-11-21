@@ -1,34 +1,5 @@
 'use strict';
 
-const { wrapStreamUrl } = require('../lib/hls-proxy');
-/**
- * GET /video/*  ou  GET /video?url=
- *
- * Recebe a URL do player e devolve a URL final do vídeo (m3u8/mp4).
- * Zero dependência além do Node (http/https/crypto).
- *
- * Aceita:
- *   - https://bysebuho.com/e/jrurapf5nqdk
- *   - https://viewplayer.online/filme/tt33764258
- *   - https://n1mwq.org/{token}/jrurapf5nqdk
- *   - só o code: jrurapf5nqdk
- *   - m3u8/mp4 direto (repasse)
- *
- * Exemplo:
- *   GET /video/https%3A%2F%2Fbysebuho.com%2Fe%2Fjrurapf5nqdk
- *   GET /video?url=https://bysebuho.com/e/jrurapf5nqdk
- *
- * No Express / Fastify:
- *   const { handler } = require('./video');
- *   app.get('/video', handler);
- *   app.get('/video/*', handler);
- *
- * Uso direto:
- *   const { getVideo } = require('./video');
- *   const r = await getVideo('https://bysebuho.com/e/jrurapf5nqdk');
- *   // r.url → master.m3u8
- */
-
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
@@ -37,6 +8,7 @@ const { URL } = require('url');
 const TIMEOUT = Number(process.env.PROVIDER_TIMEOUT_MS) || 25000;
 const BYSE = 'https://bysebuho.com';
 const VIEWPLAYER = 'https://viewplayer.online';
+const ABYSS = 'https://abyssplayer.com';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -150,7 +122,6 @@ function rawFromReq(req) {
     const m = String(req.originalUrl).match(/\/(?:video(?:\/v1)?|play\/v1)\/(.+?)(?:\?|$)/i);
     if (m) raw = m[1];
   }
-  // Fastify raw url
   if (!raw && req.url) {
     const m = String(req.url).match(/\/video\/(.+?)(?:\?|$)/i);
     if (m) raw = m[1];
@@ -174,10 +145,6 @@ function formatOf(url) {
 
 /* ───────────────── Bysebuho AES-GCM ───────────────── */
 
-/**
- * version N → índices 1-based [N, 31-N] nos key_parts
- * (mesma lógica do front byse)
- */
 function selectKeyParts(playback) {
   const parts = Array.isArray(playback.key_parts) ? playback.key_parts : [];
   const n = Number(String(playback.version || '').trim());
@@ -215,7 +182,6 @@ async function resolveByseCode(code) {
     Origin: BYSE,
   });
 
-  // source em claro (se um dia vier)
   const plain =
     data.source ||
     data.file ||
@@ -264,30 +230,58 @@ async function resolveByseCode(code) {
 
 /* ───────────────── ViewPlayer ───────────────── */
 
-function parseDataSources(html) {
+/** Extrai data-source dos botões .player-option (novo) + fallback antigo */
+function parseViewPlayerSources(html) {
   const out = [];
-  const re = /data-source=["']([^"']+)["'][^>]*data-audio=["']([^"']*)["']|data-audio=["']([^"']*)["'][^>]*data-source=["']([^"']+)["']/gi;
-  let m;
-  while ((m = re.exec(html))) {
-    const src = m[1] || m[4];
-    const audio = (m[2] || m[3] || '').toLowerCase();
-    if (src) out.push({ src, audio });
+
+  // 1) Novo: <button class="player-option" data-source="..." data-audio="...">
+  const reBtn = /<button[^>]*class=["'][^"']*player-option[^"']*["'][^>]*>/gi;
+  let mBtn;
+  while ((mBtn = reBtn.exec(html))) {
+    const tag = mBtn[0];
+    const srcM = tag.match(/data-source=["']([^"']+)["']/i);
+    const audioM = tag.match(/data-audio=["']([^"']*)["']/i);
+    const labelM = tag.match(/<strong>([^<]+)<\/strong>/i); // não vem no tag, mas tentamos depois
+    if (srcM) {
+      out.push({
+        src: srcM[1],
+        audio: (audioM ? audioM[1] : '').toLowerCase(),
+        label: null,
+      });
+    }
   }
-  if (out.length === 0) {
-    const re2 = /data-source=["']([^"']+)["']/gi;
-    while ((m = re2.exec(html))) out.push({ src: m[1], audio: '' });
+
+  // 2) Fallback: <... data-source="..." data-audio="...">  (genérico)
+  if (!out.length) {
+    const reDs = /data-source=["']([^"']+)["'][^>]*data-audio=["']([^"']*)["']|data-audio=["']([^"']*)["'][^>]*data-source=["']([^"']+)["']/gi;
+    let m;
+    while ((m = reDs.exec(html))) {
+      out.push({
+        src: m[1] || m[4],
+        audio: (m[2] || m[3] || '').toLowerCase(),
+        label: null,
+      });
+    }
   }
+
+  // 3) Fallback final: qualquer data-source solto
+  if (!out.length) {
+    const re = /data-source=["']([^"']+)["']/gi;
+    let m;
+    while ((m = re.exec(html))) out.push({ src: m[1], audio: '', label: null });
+  }
+
   return out;
 }
 
 async function resolveViewPlayer(url) {
   const html = await getText(url, { Referer: 'https://megacine.yachts/' });
-  const options = parseDataSources(html);
+  const options = parseViewPlayerSources(html);
   if (!options.length) throw new Error('ViewPlayer: nenhum data-source');
 
+  // Prioriza dublado
   const ordered = [
-    ...options.filter((o) => /bysebuho|byse\.sx|n1mwq/i.test(o.src) && /dub/i.test(o.audio)),
-    ...options.filter((o) => /bysebuho|byse\.sx|n1mwq/i.test(o.src)),
+    ...options.filter((o) => /dub/i.test(o.audio)),
     ...options,
   ];
 
@@ -297,6 +291,16 @@ async function resolveViewPlayer(url) {
   for (const opt of ordered) {
     if (tried.has(opt.src)) continue;
     tried.add(opt.src);
+
+    // abyssplayer → resolve com referer correto
+    if (/abyssplayer\.com/i.test(opt.src)) {
+      try {
+        return await resolveAbyssPlayer(opt.src);
+      } catch (e) {
+        lastErr = e;
+        continue;
+      }
+    }
 
     const code = extractByseCode(opt.src);
     if (code) {
@@ -327,6 +331,77 @@ async function resolveViewPlayer(url) {
   throw lastErr || new Error('ViewPlayer: nenhum source resolveu stream');
 }
 
+/* ───────────────── AbyssPlayer ───────────────── */
+
+async function resolveAbyssPlayer(playerUrl) {
+  // Abyss pode usar player.abyssplayer.com também
+  const ref = /player\.abyssplayer\.com/i.test(playerUrl)
+    ? 'https://player.abyssplayer.com/'
+    : ABYSS + '/';
+
+  // 1. Requisição inicial com Referer do player (simula embed)
+  const first = await request(playerUrl, {
+    accept: 'text/html',
+    headers: { Referer: ref },
+  });
+
+  // 2. Se for 3xx, segue até chegar no mp4/m3u8
+  let finalUrl = playerUrl;
+  let current = first;
+  let hops = 0;
+
+  while (hops < 5 && current.status >= 300 && current.status < 400) {
+    const loc = current.headers.location;
+    if (!loc) break;
+    finalUrl = loc.startsWith('http') ? loc : new URL(loc, finalUrl).toString();
+    current = await request(finalUrl, {
+      accept: '*/*',
+      headers: { Referer: ref, Range: 'bytes=0-0' },
+    });
+    hops++;
+  }
+
+  // 3. Se caiu em mp4/m3u8, é o final
+  if (/\.mp4(\?|$)|\.m3u8(\?|$)/i.test(finalUrl)) {
+    return {
+      url: finalUrl,
+      format: formatOf(finalUrl),
+      quality: null,
+      title: null,
+      expiresAt: null,
+      sources: [{ url: finalUrl }],
+      headers: { Referer: ref, Origin: ABYSS },
+      playerSource: playerUrl,
+      audio: 'dubbed',
+    };
+  }
+
+  // 4. Fallback: tenta extrair links do HTML (caso não haja redirect direto)
+  const html = current.text || '';
+  const linkM =
+    html.match(/["'](https?:\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i) ||
+    html.match(/["'](\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i);
+
+  if (linkM) {
+    const raw = linkM[1].startsWith('//') ? 'https:' + linkM[1] : linkM[1];
+    return {
+      url: raw,
+      format: formatOf(raw),
+      quality: null,
+      title: null,
+      expiresAt: null,
+      sources: [{ url: raw }],
+      headers: { Referer: ref, Origin: ABYSS },
+      playerSource: playerUrl,
+      audio: 'dubbed',
+    };
+  }
+
+  const e = new Error('AbyssPlayer: não foi possível extrair mp4/m3u8');
+  e.status = 404;
+  throw e;
+}
+
 /* ───────────────── resolve ───────────────── */
 
 async function resolvePlayer(raw) {
@@ -336,6 +411,7 @@ async function resolvePlayer(raw) {
     throw e;
   }
 
+  // m3u8/mp4 direto
   if (/\.m3u8(\?|$)/i.test(raw) || /\.mp4(\?|$)/i.test(raw)) {
     return {
       url: raw,
@@ -348,32 +424,47 @@ async function resolvePlayer(raw) {
     };
   }
 
+  // abyssplayer direto
+  if (/abyssplayer\.com/i.test(raw)) {
+    return resolveAbyssPlayer(raw);
+  }
+
+  // bysebuho
   const code = extractByseCode(raw);
   if (code && (/bysebuho|byse\.sx|n1mwq|\/e\//i.test(raw) || /^[a-zA-Z0-9]{8,20}$/.test(raw))) {
     return resolveByseCode(code);
   }
 
+  // viewplayer (episódio ou filme)
   if (/viewplayer\.online/i.test(raw)) {
     return resolveViewPlayer(raw);
   }
 
+  // genérico: tenta byse, depois html
   if (code) {
     try {
       return await resolveByseCode(code);
     } catch {
-      /* genérico */
+      /* segue */
     }
   }
 
   const html = await getText(raw);
-  const options = parseDataSources(html);
+  const options = parseViewPlayerSources(html);
   const hrefs = String(html).match(/https?:\/\/[^\s"'<>]+/gi) || [];
   const candidates = [
     ...options.map((o) => o.src),
-    ...hrefs.filter((u) => /bysebuho|\/e\/[a-z0-9]+|\.m3u8|\.mp4|viewplayer/i.test(u)),
+    ...hrefs.filter((u) => /abyssplayer|\/e\/[a-z0-9]+|\.m3u8|\.mp4|viewplayer/i.test(u)),
   ];
 
   for (const src of [...new Set(candidates)]) {
+    if (/abyssplayer\.com/i.test(src)) {
+      try {
+        return await resolveAbyssPlayer(src);
+      } catch {
+        /* next */
+      }
+    }
     if (/viewplayer\.online/i.test(src)) {
       try {
         return await resolveViewPlayer(src);
@@ -410,52 +501,37 @@ async function resolvePlayer(raw) {
 /* ───────────────── handler ───────────────── */
 
 async function handler(req, res) {
-  // Fastify e Express
   const reply = res;
   try {
     const raw = rawFromReq(req);
     if (!raw) {
-      return reply.status(400).send
-        ? reply.status(400).send({ success: false, error: 'Envie a URL do player em /video/{url} ou ?url=' })
-        : reply.status(400).json({ success: false, error: 'Envie a URL do player em /video/{url} ou ?url=' });
+      const body = { success: false, error: 'Envie a URL do player em /video/{url} ou ?url=' };
+      if (typeof reply.status === 'function') {
+        const r = reply.status(400);
+        return typeof r.send === 'function' && !r.json ? r.send(body) : r.json(body);
+      }
+      reply.statusCode = 400;
+      return reply.end(JSON.stringify(body));
     }
 
     const stream = await resolvePlayer(raw);
-    const referer = (stream.headers && stream.headers.Referer) || `${BYSE}/`;
-    const useProxy = String(process.env.HLS_PROXY || '1') !== '0';
+    const referer = (stream.headers && stream.headers.Referer) || '';
     const directUrl = stream.url;
-    const proxiedUrl =
-      useProxy && stream.format !== 'mp4'
-        ? wrapStreamUrl(req, directUrl, referer)
-        : directUrl;
-
-    const sources = (stream.sources || [{ url: directUrl }]).map((s) => {
-      const u = s.url || s.file;
-      if (!u) return s;
-      if (useProxy && stream.format !== 'mp4') {
-        return { ...s, url: wrapStreamUrl(req, u, referer), directUrl: u };
-      }
-      return s;
-    });
 
     const body = {
       success: true,
-      format: stream.format || 'hls',
-      url: proxiedUrl,
-      directUrl: directUrl,
-      proxied: useProxy && proxiedUrl !== directUrl,
+      format: stream.format || 'mp4',
+      url: directUrl,
+      directUrl,
       quality: stream.quality || null,
       title: stream.title || null,
       expiresAt: stream.expiresAt || null,
-      // player usa a URL já proxied — headers do CDN não são mais necessários no client
-      headers: useProxy && proxiedUrl !== directUrl ? {} : (stream.headers || { Referer: `${BYSE}/` }),
-      sources,
+      headers: stream.headers || (referer ? { Referer: referer } : {}),
+      sources: stream.sources || [{ url: directUrl }],
       player: raw,
     };
 
-    if (typeof reply.send === 'function' && !reply.json) {
-      return reply.send(body);
-    }
+    if (typeof reply.send === 'function' && !reply.json) return reply.send(body);
     return reply.json(body);
   } catch (err) {
     const status = err.status || 500;
@@ -471,7 +547,6 @@ async function handler(req, res) {
   }
 }
 
-/** Uso programático */
 async function getVideo(playerUrl) {
   return resolvePlayer(String(playerUrl || '').trim());
 }
@@ -482,6 +557,7 @@ module.exports = {
   resolvePlayer,
   resolveByseCode,
   resolveViewPlayer,
+  resolveAbyssPlayer,
   decryptPlayback,
   extractByseCode,
 };
