@@ -1,6 +1,6 @@
 {
-  "name": "tedflix-provider-topfilmes",
-  "version": "4.2.1",
+  "name": "tedflix-provider",
+  "version": "4.1.0",
   "private": true,
   "main": "server.js",
   "scripts": {
