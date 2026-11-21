@@ -140,7 +140,7 @@ function formatOf(url) {
   if (/\.m3u8(\?|$)/i.test(url) || /mpegurl|hls/i.test(url)) return 'hls';
   if (/\.mp4(\?|$)/i.test(url)) return 'mp4';
   if (/\.webm(\?|$)/i.test(url)) return 'webm';
-  return 'hls';
+  return 'mp4';
 }
 
 /* ───────────────── Bysebuho AES-GCM ───────────────── */
@@ -230,18 +230,14 @@ async function resolveByseCode(code) {
 
 /* ───────────────── ViewPlayer ───────────────── */
 
-/** Extrai data-source dos botões .player-option (novo) + fallback antigo */
 function parseViewPlayerSources(html) {
   const out = [];
-
-  // 1) Novo: <button class="player-option" data-source="..." data-audio="...">
   const reBtn = /<button[^>]*class=["'][^"']*player-option[^"']*["'][^>]*>/gi;
   let mBtn;
   while ((mBtn = reBtn.exec(html))) {
     const tag = mBtn[0];
     const srcM = tag.match(/data-source=["']([^"']+)["']/i);
     const audioM = tag.match(/data-audio=["']([^"']*)["']/i);
-    const labelM = tag.match(/<strong>([^<]+)<\/strong>/i); // não vem no tag, mas tentamos depois
     if (srcM) {
       out.push({
         src: srcM[1],
@@ -251,7 +247,6 @@ function parseViewPlayerSources(html) {
     }
   }
 
-  // 2) Fallback: <... data-source="..." data-audio="...">  (genérico)
   if (!out.length) {
     const reDs = /data-source=["']([^"']+)["'][^>]*data-audio=["']([^"']*)["']|data-audio=["']([^"']*)["'][^>]*data-source=["']([^"']+)["']/gi;
     let m;
@@ -264,7 +259,6 @@ function parseViewPlayerSources(html) {
     }
   }
 
-  // 3) Fallback final: qualquer data-source solto
   if (!out.length) {
     const re = /data-source=["']([^"']+)["']/gi;
     let m;
@@ -279,7 +273,6 @@ async function resolveViewPlayer(url) {
   const options = parseViewPlayerSources(html);
   if (!options.length) throw new Error('ViewPlayer: nenhum data-source');
 
-  // Prioriza dublado
   const ordered = [
     ...options.filter((o) => /dub/i.test(o.audio)),
     ...options,
@@ -292,7 +285,6 @@ async function resolveViewPlayer(url) {
     if (tried.has(opt.src)) continue;
     tried.add(opt.src);
 
-    // abyssplayer → resolve com referer correto
     if (/abyssplayer\.com/i.test(opt.src)) {
       try {
         return await resolveAbyssPlayer(opt.src);
@@ -334,18 +326,17 @@ async function resolveViewPlayer(url) {
 /* ───────────────── AbyssPlayer ───────────────── */
 
 async function resolveAbyssPlayer(playerUrl) {
-  // Abyss pode usar player.abyssplayer.com também
   const ref = /player\.abyssplayer\.com/i.test(playerUrl)
     ? 'https://player.abyssplayer.com/'
     : ABYSS + '/';
 
-  // 1. Requisição inicial com Referer do player (simula embed)
+  // 1. Requisição inicial
   const first = await request(playerUrl, {
     accept: 'text/html',
     headers: { Referer: ref },
   });
 
-  // 2. Se for 3xx, segue até chegar no mp4/m3u8
+  // 2. Segue 302 (se houver)
   let finalUrl = playerUrl;
   let current = first;
   let hops = 0;
@@ -361,14 +352,11 @@ async function resolveAbyssPlayer(playerUrl) {
     hops++;
   }
 
-  // 3. Se caiu em mp4/m3u8, é o final
-  if (/\.mp4(\?|$)|\.m3u8(\?|$)/i.test(finalUrl)) {
+  if (/\.mp4(\?|$)|\.m3u8(\?|$)|storage\.googleapis/i.test(finalUrl)) {
     return {
       url: finalUrl,
       format: formatOf(finalUrl),
-      quality: null,
-      title: null,
-      expiresAt: null,
+      quality: null, title: null, expiresAt: null,
       sources: [{ url: finalUrl }],
       headers: { Referer: ref, Origin: ABYSS },
       playerSource: playerUrl,
@@ -376,25 +364,50 @@ async function resolveAbyssPlayer(playerUrl) {
     };
   }
 
-  // 4. Fallback: tenta extrair links do HTML (caso não haja redirect direto)
   const html = current.text || '';
-  const linkM =
-    html.match(/["'](https?:\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i) ||
-    html.match(/["'](\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i);
+  
+  // 3. Procura links conhecidos (padrões JWPlayer, VideoJS, etc) e Google Storage
+  const patterns = [
+    /file\s*:\s*["'](https?:\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i,
+    /source\s*:\s*["'](https?:\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i,
+    /["'](https?:\/\/storage\.googleapis\.com\/[^"']+)["']/i,
+    /["'](https?:\/\/[^"']+\.(?:mp4|m3u8)[^"']*)["']/i,
+    /(https?:\/\/storage\.googleapis\.com\/[^\s"'\\]+)/i,
+    /(https?:\/\/[^\s"'\\]+\.(?:mp4|m3u8)[^\s"'\\]*)/i
+  ];
 
-  if (linkM) {
-    const raw = linkM[1].startsWith('//') ? 'https:' + linkM[1] : linkM[1];
-    return {
-      url: raw,
-      format: formatOf(raw),
-      quality: null,
-      title: null,
-      expiresAt: null,
-      sources: [{ url: raw }],
-      headers: { Referer: ref, Origin: ABYSS },
-      playerSource: playerUrl,
-      audio: 'dubbed',
-    };
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m) {
+      let url = m[1].replace(/\\/g, ''); // remove escapes
+      if (url.startsWith('//')) url = 'https:' + url;
+      return {
+        url, format: formatOf(url), quality: null, title: null, expiresAt: null,
+        sources: [{ url }],
+        headers: { Referer: ref, Origin: ABYSS },
+        playerSource: playerUrl, audio: 'dubbed',
+      };
+    }
+  }
+
+  // 4. Fallback: decodificar Base64 (alguns players escondem assim)
+  const b64matches = html.match(/[a-zA-Z0-9+/]{40,}={0,2}/g) || [];
+  for (const b64 of b64matches) {
+    try {
+      const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+      const m = decoded.match(/(https?:\/\/[^\s"'\\]+\.(?:mp4|m3u8)[^\s"'\\]*)/i) ||
+                decoded.match(/(https?:\/\/storage\.googleapis\.com\/[^\s"'\\]+)/i);
+      if (m) {
+         let url = m[1];
+         if (url.startsWith('//')) url = 'https:' + url;
+         return {
+            url, format: formatOf(url), quality: null, title: null, expiresAt: null,
+            sources: [{ url }],
+            headers: { Referer: ref, Origin: ABYSS },
+            playerSource: playerUrl, audio: 'dubbed',
+         };
+      }
+    } catch {}
   }
 
   const e = new Error('AbyssPlayer: não foi possível extrair mp4/m3u8');
@@ -411,42 +424,24 @@ async function resolvePlayer(raw) {
     throw e;
   }
 
-  // m3u8/mp4 direto
   if (/\.m3u8(\?|$)/i.test(raw) || /\.mp4(\?|$)/i.test(raw)) {
     return {
-      url: raw,
-      format: formatOf(raw),
-      quality: null,
-      title: null,
-      expiresAt: null,
-      sources: [{ url: raw }],
-      headers: {},
+      url: raw, format: formatOf(raw), quality: null, title: null, expiresAt: null,
+      sources: [{ url: raw }], headers: {},
     };
   }
 
-  // abyssplayer direto
-  if (/abyssplayer\.com/i.test(raw)) {
-    return resolveAbyssPlayer(raw);
-  }
+  if (/abyssplayer\.com/i.test(raw)) return resolveAbyssPlayer(raw);
 
-  // bysebuho
   const code = extractByseCode(raw);
   if (code && (/bysebuho|byse\.sx|n1mwq|\/e\//i.test(raw) || /^[a-zA-Z0-9]{8,20}$/.test(raw))) {
     return resolveByseCode(code);
   }
 
-  // viewplayer (episódio ou filme)
-  if (/viewplayer\.online/i.test(raw)) {
-    return resolveViewPlayer(raw);
-  }
+  if (/viewplayer\.online/i.test(raw)) return resolveViewPlayer(raw);
 
-  // genérico: tenta byse, depois html
   if (code) {
-    try {
-      return await resolveByseCode(code);
-    } catch {
-      /* segue */
-    }
+    try { return await resolveByseCode(code); } catch {}
   }
 
   const html = await getText(raw);
@@ -459,36 +454,19 @@ async function resolvePlayer(raw) {
 
   for (const src of [...new Set(candidates)]) {
     if (/abyssplayer\.com/i.test(src)) {
-      try {
-        return await resolveAbyssPlayer(src);
-      } catch {
-        /* next */
-      }
+      try { return await resolveAbyssPlayer(src); } catch {}
     }
     if (/viewplayer\.online/i.test(src)) {
-      try {
-        return await resolveViewPlayer(src);
-      } catch {
-        /* next */
-      }
+      try { return await resolveViewPlayer(src); } catch {}
     }
     const c = extractByseCode(src);
     if (c) {
-      try {
-        return await resolveByseCode(c);
-      } catch {
-        /* next */
-      }
+      try { return await resolveByseCode(c); } catch {}
     }
     if (/\.m3u8|\.mp4/i.test(src)) {
       return {
-        url: src,
-        format: formatOf(src),
-        quality: null,
-        title: null,
-        expiresAt: null,
-        sources: [{ url: src }],
-        headers: { Referer: raw },
+        url: src, format: formatOf(src), quality: null, title: null, expiresAt: null,
+        sources: [{ url: src }], headers: { Referer: raw },
       };
     }
   }
