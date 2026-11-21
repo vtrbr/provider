@@ -95,12 +95,14 @@ try {
 } catch (e) {
   console.warn('[boot] filmes:', e.message);
 }
+
 try {
   app.get('/series', require('./series').handler);
   console.log('[boot] /series');
 } catch (e) {
   console.warn('[boot] series:', e.message);
 }
+
 try {
   app.get('/filmes-novos', require('./filmes-novos').handler);
   app.get('/lancamentos', require('./filmes-novos').handler);
@@ -116,12 +118,15 @@ const mounted = [];
 if (fs.existsSync(catDir)) {
   for (const file of fs.readdirSync(catDir).filter((f) => f.endsWith('.js'))) {
     const slug = file.replace(/\.js$/, '');
+
     try {
       const mod = require(path.join(catDir, file));
       if (!mod.handler) continue;
+
       app.get(`/${slug}`, mod.handler);
       app.get(`/categoria/${slug}`, mod.handler);
       app.get(`/genero/${slug}`, mod.handler);
+
       mounted.push(slug);
       console.log(`[boot] /${slug}`);
     } catch (e) {
@@ -173,7 +178,9 @@ try {
 try {
   const playV1 = require('./video/mega-video');
 
-  app.get('/player/abyss', (req, res) => playV1.abyssPlayerHandler(req, res));
+  app.get('/player/abyss', (req, res) =>
+    playV1.abyssPlayerHandler(req, res)
+  );
 
   app.get('/player/abyss/:slug', (req, res) => {
     req.params = req.params || {};
@@ -184,3 +191,26 @@ try {
   app.get('/player/abyss/*', (req, res) => {
     const rest = (req.path || '').replace(/^\/player\/abyss\/?/, '');
     req.params = req.params || {};
+    req.params[0] = rest;
+    return playV1.abyssPlayerHandler(req, res);
+  });
+
+  console.log('[boot] /player/abyss');
+} catch (e) {
+  console.warn('[boot] player-abyss:', e.message);
+}
+
+// ───────────── 404 ─────────────
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Route not found',
+    path: req.originalUrl || req.url,
+  });
+});
+
+// ───────────── start ─────────────
+app.listen(PORT, HOST, () => {
+  console.log(`[boot] TEDFLIX Provider API listening on http://${HOST}:${PORT}`);
+  console.log(`[boot] ${mounted.length} categorias carregadas`);
+});
