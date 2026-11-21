@@ -25,6 +25,7 @@
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const cheerio = require('cheerio');
 
 const TIMEOUT = Number(process.env.PROVIDER_TIMEOUT_MS) || 25000;
 const MEGACINE = (process.env.MEGACINE_URL || 'https://megacine.yachts').replace(/\/+$/, '');
@@ -171,63 +172,121 @@ function audioKey(label) {
   return t || 'default';
 }
 
+/* ───────────────── JSON-LD helper ───────────────── */
+
+function parseJSONLD(html) {
+  const patterns = [
+    /<script[^>]*class=["'][^"']*megacine-schema-tvseries["'][^>]*>([\s\S]*?)<\/script>/i,
+    /<script[^>]*class=["'][^"']*megacine-schema-movie["'][^>]*>([\s\S]*?)<\/script>/i,
+    /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?TVSeries[\s\S]*?)<\/script>/i,
+  ];
+  for (const re of patterns) {
+    const m = String(html).match(re);
+    if (!m) continue;
+    try {
+      const obj = JSON.parse(m[1].trim());
+      if (obj && obj['@graph']) {
+        const node = obj['@graph'].find(
+          (n) => n['@type'] === 'TVSeries' || n['@type'] === 'Movie'
+        );
+        if (node) return node;
+      }
+      return obj;
+    } catch {
+      /* ignora JSON quebrado */
+    }
+  }
+  return null;
+}
+
 /* ───────────────── parse MegaCine page ───────────────── */
 
 function parseMegaCineSerie(html, pageUrl) {
+  const ld = parseJSONLD(html);
+
+  /* ---- título ---- */
   const title =
+    (ld && ld.name) ||
     firstMatch(html, /id=["']titleHis["'][^>]*>([^<]+)/i) ||
     firstMatch(html, /property=["']og:title["'][^>]*content=["']([^"']+)/i) ||
     firstMatch(html, /<title>([^<]+)/i);
 
+  /* ---- título original ---- */
   const originalTitle =
+    (ld && ld.alternateName) ||
     firstMatch(html, /T[ií]tulo original:\s*<span[^>]*class=["']valor["'][^>]*>([^<]+)/i) ||
     firstMatch(html, /T[ií]tulo original:\s*<span[^>]*>([^<]+)/i);
 
+  /* ---- nota ---- */
   const rating =
+    (ld && ld.aggregateRating && ld.aggregateRating.ratingValue) ||
     firstMatch(html, /data-rating=["']([^"']+)/i) ||
     firstMatch(html, /class=["'][^"']*rating["'][^>]*>([0-9.]+)/i);
 
+  /* ---- temporadas ---- */
   const seasonsCount =
+    (ld && ld.numberOfSeasons) ||
     firstMatch(html, /TEMPORADAS:\s*<\/b>\s*<span[^>]*class=["']valor["'][^>]*>([^<]+)/i) ||
     firstMatch(html, /TEMPORADAS:[\s\S]{0,80}?class=["']valor["'][^>]*>([^<]+)/i);
 
-  // backdrop
-  const backdrop =
-    firstMatch(html, /#dt_contenedor\s*\{[^}]*background-image:\s*url\(([^)]+)\)/i) ||
-    firstMatch(html, /background-image:\s*url\(([^)]+)\)/i);
-
-  // poster
+  /* ---- poster (capa) ---- */
   const poster =
+    (ld && ld.image) ||
+    firstMatch(html, /id=["']thumbHis["'][^>]*src=["']([^"']+)/i) ||
     firstMatch(html, /itemprop=["']image["'][^>]*src=["']([^"']+)/i) ||
-    firstMatch(html, /class=["'][^"']*poster[^"']*["'][\s\S]{0,300}?src=["']([^"']+)/i) ||
+    firstMatch(html, /class=["'][^"']*poster["'][\s\S]{0,400}?<img[^>]*src=["']([^"']+)/i) ||
     firstMatch(html, /property=["']og:image["'][^>]*content=["']([^"']+)/i);
 
-  // sinopse (remove iframe do bloco)
+  /* ---- backdrop ---- */
+  const bgMatch = html.match(
+    /#dt_contenedor\s*\{[^}]*background-image:\s*url\(['"]?([^)'"]+)['"]?\)/i
+  );
+  const backdrop =
+    (bgMatch && bgMatch[1]) ||
+    firstMatch(html, /background-image:\s*url\(['"]?(https?:\/\/[^)'"]+)['"]?\)/i);
+
+  /* ---- sinopse ---- */
   let overview = null;
-  const sin = firstMatch(html, /class=["']sinopse-texto["'][^>]*>([\s\S]*?)<\/div>/i);
-  if (sin) {
-    overview = decodeHtml(sin.replace(/<iframe[\s\S]*?<\/iframe>/gi, ''));
+  if (ld && ld.description) {
+    overview = decodeHtml(ld.description);
+  } else {
+    const sin = firstMatch(html, /class=["']sinopse-texto["'][^>]*>([\s\S]*?)<\/div>/i);
+    if (sin) overview = decodeHtml(sin.replace(/<iframe[\s\S]*?<\/iframe>/gi, ''));
   }
 
-  // embed viewplayer
+  /* ---- embed viewplayer ---- */
   let embed =
     firstMatch(html, /src=["'](https?:\/\/viewplayer\.online\/embed\/[^"']+)["']/i) ||
+    (ld && ld.embedUrl) ||
     firstMatch(html, /(https?:\/\/viewplayer\.online\/embed\/[a-zA-Z0-9\-_]+\/?)/i);
-
   if (embed && !embed.endsWith('/')) embed += '/';
 
-  const postId = firstMatch(html, /data-id=["'](\d+)["']/i);
-  const year = firstMatch(html, /date[^>]*>\s*(\d{4})/i);
+  /* ---- id ---- */
+  const postId =
+    firstMatch(html, /data-id=["'](\d+)["']/i) ||
+    firstMatch(html, /postid-(\d+)/i);
 
-  // gêneros só da página do título (evita menu)
+  /* ---- ano ---- */
+  const year =
+    (ld && ld.datePublished && ld.datePublished.slice(0, 4)) ||
+    firstMatch(html, /date[^>]*>\s*(\d{4})/i);
+
+  /* ---- gêneros (JSON-LD é mais limpo) ---- */
   const genres = [];
-  const genreBlock = firstMatch(html, /class=["']sgeneros["'][^>]*>([\s\S]*?)<\/div>/i);
-  if (genreBlock) {
-    const re = /\/generos\/[^"']+["'][^>]*>([^<]+)/gi;
-    let m;
-    while ((m = re.exec(genreBlock))) {
-      const g = m[1].trim();
-      if (g && !genres.includes(g)) genres.push(g);
+  if (ld && Array.isArray(ld.genre)) {
+    for (const g of ld.genre) {
+      const t = decodeHtml(String(g)).trim();
+      if (t && !genres.includes(t)) genres.push(t);
+    }
+  } else {
+    const genreBlock = firstMatch(html, /class=["']sgeneros["'][^>]*>([\s\S]*?)<\/div>/i);
+    if (genreBlock) {
+      const re = /\/generos\/[^"']+["'][^>]*>([^<]+)/gi;
+      let m;
+      while ((m = re.exec(genreBlock))) {
+        const g = decodeHtml(m[1]).trim();
+        if (g && !genres.includes(g)) genres.push(g);
+      }
     }
   }
 
@@ -247,85 +306,83 @@ function parseMegaCineSerie(html, pageUrl) {
   };
 }
 
-/* ───────────────── parse ViewPlayer embed ───────────────── */
+/* ───────────────── parse ViewPlayer embed (cheerio) ───────────────── */
 
-/**
- * Estrutura do embed:
- *  - botões de temporada com data-season-id + data-season-number
- *  - cards "Dublado" / "Legendado"
- *  - <li data-season-id data-episode-id> <span class="episode-title">N - Nome</span>
- */
 function parseViewPlayerEmbed(html, embedUrl) {
-  // mapa seasonId -> seasonNumber
-  const seasonMap = {};
-  const reSeason = /data-season-id=["'](\d+)["'][^>]*data-season-number=["'](\d+)["']|data-season-number=["'](\d+)["'][^>]*data-season-id=["'](\d+)["']/gi;
-  let m;
-  while ((m = reSeason.exec(html))) {
-    if (m[1]) seasonMap[m[1]] = Number(m[2]);
-    else seasonMap[m[4]] = Number(m[3]);
-  }
+  const $ = cheerio.load(html);
 
-  // cards por áudio
-  const parts = String(html).split(/<h2 class="card-title">/i);
-  /** @type {Record<string, Array>} */
+  // 1) Mapa seasonId → seasonNumber
+  const seasonMap = {};
+  $('ul.header-navigation li[data-season-id]').each((_, el) => {
+    const $el = $(el);
+    const sid = $el.attr('data-season-id');
+    const snum = $el.attr('data-season-number');
+    if (sid && snum) {
+      const n = parseInt(snum, 10);
+      if (Number.isFinite(n)) seasonMap[String(sid)] = n;
+    }
+  });
+
+  // 2) Parse de cada card (Dublado / Legendado / etc)
   const byAudio = {};
 
-  for (let i = 1; i < parts.length; i++) {
-    const chunk = parts[i];
-    const titleEnd = chunk.indexOf('</h2>');
-    const audioLabel = titleEnd >= 0 ? chunk.slice(0, titleEnd).trim() : 'default';
-    const body = titleEnd >= 0 ? chunk.slice(titleEnd) : chunk;
+  $('.card').each((_, cardEl) => {
+    const $card = $(cardEl);
+    const audioLabel = ($card.find('.card-title').first().text() || '').trim() || 'default';
     const key = audioKey(audioLabel);
 
     const eps = [];
-    const reEp =
-      /data-season-id=["'](\d+)["']\s+data-episode-id=["'](\d+)["'][\s\S]*?<span class="episode-title">([^<]+)<\/span>/gi;
-    let em;
-    while ((em = reEp.exec(body))) {
-      const seasonId = em[1];
-      const episodeId = em[2];
-      const epTitle = decodeHtml(em[3]);
-      // pula "Próximo ep: dd/mm/yyyy"
-      if (/pr[oó]ximo\s*ep/i.test(epTitle)) continue;
+    $card.find('li[data-season-id][data-episode-id]').each((_, liEl) => {
+      const $li = $(liEl);
+      const seasonId = String($li.attr('data-season-id') || '').trim();
+      const episodeId = String($li.attr('data-episode-id') || '').trim();
+      if (!seasonId || !episodeId) return;
 
-      const seasonNumber = seasonMap[seasonId] || null;
-      const episodeNumber = parseEpNumber(epTitle);
+      const epTitle = ($li.find('.episode-title').first().text() || '').trim();
+      if (!epTitle) return;
+      if (/pr[oó]ximo\s*ep/i.test(epTitle)) return;
 
       eps.push({
         seasonId,
-        seasonNumber,
+        seasonNumber: seasonMap[seasonId] != null ? seasonMap[seasonId] : null,
         episodeId,
-        episodeNumber,
-        title: epTitle,
+        episodeNumber: parseEpNumber(epTitle),
+        title: decodeHtml(epTitle),
         player: episodePlayerUrl(episodeId),
       });
-    }
-    byAudio[key] = eps;
-  }
+    });
 
-  // fallback: página sem cards nomeados
-  if (Object.keys(byAudio).length === 0) {
+    if (eps.length) byAudio[key] = eps;
+  });
+
+  // 3) Fallback: se nenhum card funcionou, extrai direto do DOM
+  const hasEpisodes = Object.values(byAudio).some((arr) => arr.length > 0);
+  if (!hasEpisodes) {
     const eps = [];
-    const reEp =
-      /data-season-id=["'](\d+)["']\s+data-episode-id=["'](\d+)["'][\s\S]*?<span class="episode-title">([^<]+)<\/span>/gi;
-    while ((m = reEp.exec(html))) {
-      const epTitle = decodeHtml(m[3]);
-      if (/pr[oó]ximo\s*ep/i.test(epTitle)) continue;
+    $('li[data-season-id][data-episode-id]').each((_, liEl) => {
+      const $li = $(liEl);
+      const seasonId = String($li.attr('data-season-id') || '').trim();
+      const episodeId = String($li.attr('data-episode-id') || '').trim();
+      if (!seasonId || !episodeId) return;
+
+      const epTitle = ($li.find('.episode-title').first().text() || '').trim();
+      if (!epTitle) return;
+      if (/pr[oó]ximo\s*ep/i.test(epTitle)) return;
+
       eps.push({
-        seasonId: m[1],
-        seasonNumber: seasonMap[m[1]] || null,
-        episodeId: m[2],
+        seasonId,
+        seasonNumber: seasonMap[seasonId] || null,
+        episodeId,
         episodeNumber: parseEpNumber(epTitle),
-        title: epTitle,
-        player: episodePlayerUrl(m[2]),
+        title: decodeHtml(epTitle),
+        player: episodePlayerUrl(episodeId),
       });
-    }
+    });
     if (eps.length) byAudio.default = eps;
   }
 
-  // monta temporadas unificadas
-  // preferência: dublado como base, legendado como faixa paralela
-  const seasonBucket = new Map(); // seasonNumber -> { seasonNumber, seasonId, episodes: Map }
+  // 4) Consolida temporadas
+  const seasonBucket = new Map();
 
   function ensureSeason(seasonNumber, seasonId) {
     const key = seasonNumber != null ? String(seasonNumber) : `id:${seasonId}`;
@@ -333,7 +390,7 @@ function parseViewPlayerEmbed(html, embedUrl) {
       seasonBucket.set(key, {
         seasonNumber: seasonNumber != null ? Number(seasonNumber) : null,
         seasonId: seasonId || null,
-        episodes: new Map(), // episodeNumber|id -> ep object
+        episodes: new Map(),
       });
     }
     return seasonBucket.get(key);
@@ -344,8 +401,7 @@ function parseViewPlayerEmbed(html, embedUrl) {
       const season = ensureSeason(ep.seasonNumber, ep.seasonId);
       if (!season.seasonId && ep.seasonId) season.seasonId = ep.seasonId;
 
-      const ek =
-        ep.episodeNumber != null ? `n:${ep.episodeNumber}` : `id:${ep.episodeId}`;
+      const ek = ep.episodeNumber != null ? `n:${ep.episodeNumber}` : `id:${ep.episodeId}`;
       if (!season.episodes.has(ek)) {
         season.episodes.set(ek, {
           episodeNumber: ep.episodeNumber,
@@ -354,7 +410,6 @@ function parseViewPlayerEmbed(html, embedUrl) {
         });
       }
       const row = season.episodes.get(ek);
-      // título preferencial em português (dublado)
       if (audio === 'dublado' && ep.title) row.title = ep.title;
       if (!row.title) row.title = ep.title;
       row.players[audio] = {
@@ -365,18 +420,15 @@ function parseViewPlayerEmbed(html, embedUrl) {
   }
 
   const seasons = [...seasonBucket.values()]
-    .map((s) => {
-      const episodes = [...s.episodes.values()].sort((a, b) => {
+    .map((s) => ({
+      seasonNumber: s.seasonNumber,
+      seasonId: s.seasonId,
+      episodes: [...s.episodes.values()].sort((a, b) => {
         const na = a.episodeNumber ?? 9999;
         const nb = b.episodeNumber ?? 9999;
         return na - nb;
-      });
-      return {
-        seasonNumber: s.seasonNumber,
-        seasonId: s.seasonId,
-        episodes,
-      };
-    })
+      }),
+    }))
     .sort((a, b) => {
       const na = a.seasonNumber ?? 9999;
       const nb = b.seasonNumber ?? 9999;
@@ -417,14 +469,14 @@ async function resolveSerie(raw) {
 
   let embedUrl = null;
 
-  // já é embed do viewplayer
   if (/viewplayer\.online\/embed\//i.test(raw)) {
     embedUrl = raw.endsWith('/') ? raw : raw + '/';
     meta.embedUrl = embedUrl;
     meta.pageUrl = raw;
   } else {
-    // página MegaCine (ou genérica)
-    const pageUrl = /^https?:\/\//i.test(raw) ? raw : `${MEGACINE}${raw.startsWith('/') ? '' : '/'}${raw}`;
+    const pageUrl = /^https?:\/\//i.test(raw)
+      ? raw
+      : `${MEGACINE}${raw.startsWith('/') ? '' : '/'}${raw}`;
     const html = await getHtml(pageUrl, { Referer: MEGACINE + '/' });
     meta = parseMegaCineSerie(html, pageUrl);
     embedUrl = meta.embedUrl;
@@ -439,11 +491,11 @@ async function resolveSerie(raw) {
   const embedHtml = await getHtml(embedUrl, { Referer: meta.pageUrl || MEGACINE + '/' });
   const parsed = parseViewPlayerEmbed(embedHtml, embedUrl);
 
-  // contagem real vem do embed (página MegaCine às vezes fica desatualizada)
-  const seasonsCount = Math.max(
-    Number(meta.seasonsCount) || 0,
-    parsed.seasons.length || 0
-  ) || null;
+  const seasonsCount =
+    Math.max(
+      Number(meta.seasonsCount) || 0,
+      parsed.seasons.length || 0
+    ) || null;
 
   return {
     success: true,
@@ -520,5 +572,6 @@ module.exports = {
   resolveSerie,
   parseMegaCineSerie,
   parseViewPlayerEmbed,
+  parseJSONLD,
   episodePlayerUrl,
 };
